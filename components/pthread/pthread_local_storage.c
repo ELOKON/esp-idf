@@ -127,6 +127,55 @@ static void pthread_cleanup_thread_specific_data_callback(int index, void *v_tls
     values_list_t *tls = (values_list_t *)v_tls;
     assert(tls != NULL);
 
+    // The Rust standard library assumes TLS keys with destructors are all
+    // destructed before keys without destructors are deallocated.  This
+    // behavior is not guaranteed by POSIX.  This not happening is not a safety
+    // issue, but leads to leaking memory when threads exit.
+    //
+    // Solving this properly in the Rust standard library is not entirely
+    // obvious so for now we're working around it by freeing the TLS keys in
+    // multiple passes, which sadly means that we need to make multiple extra
+    // iterations through the TLS value list.
+    //
+    // First we loop over the list and deallocate values with a destructor
+    // until we've looped through the list once with no destructors run.  This
+    // is necessary because destructors can set a new value for a key with a
+    // destructor, and the list is singly-linked so we can only loop over it
+    // from one direction.
+    //
+    // After that's done we finally free all values without destructors.
+    while (1) {
+        value_entry_t *entry = SLIST_FIRST(tls);
+        bool ran_any_destructors = false;
+
+        while (entry != NULL) {
+            key_entry_t *key = find_key(entry->key);
+            if (key == NULL || key->destructor == NULL) {
+                entry = SLIST_NEXT(entry, next);
+                continue;
+            }
+
+            value_entry_t *current = entry;
+
+            if (entry == SLIST_FIRST(tls)) {
+                SLIST_REMOVE_HEAD(tls, next);
+                entry = SLIST_FIRST(tls);
+            } else {
+                entry = SLIST_NEXT(entry, next);
+                SLIST_REMOVE(tls, current, value_entry_t_, next);
+            }
+
+            key->destructor(current->value);
+            ran_any_destructors = true;
+            free(current);
+        }
+
+        // Once we iterated over the list once while running no destructors we're done.
+        if (!ran_any_destructors) {
+            break;
+        }
+    }
+
     /* Walk the list, freeing all entries and calling destructors if they are registered */
     while (1) {
         value_entry_t *entry = SLIST_FIRST(tls);
@@ -135,13 +184,12 @@ static void pthread_cleanup_thread_specific_data_callback(int index, void *v_tls
         }
         SLIST_REMOVE_HEAD(tls, next);
 
-        // This is a little slow, walking the linked list of keys once per value,
-        // but assumes that the thread's value list will have less entries
-        // than the keys list
+        // All keys with destructors should have been freed in the previous loop.
         key_entry_t *key = find_key(entry->key);
-        if (key != NULL && key->destructor != NULL) {
-            key->destructor(entry->value);
+        if (key != NULL) {
+            assert(key->destructor == NULL);
         }
+
         free(entry);
     }
     free(tls);
